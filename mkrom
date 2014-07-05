@@ -1,0 +1,226 @@
+#!/usr/bin/env python
+
+import sys
+import logging
+import argparse
+
+from math import log
+
+logging.basicConfig()
+logger = logging.getLogger('mkrom')
+
+
+comment = "#"
+ignores = set(["\n", "\t", " "])
+allowed = "0123456789abcdef"
+
+radix_prefix = {2: 'b', 8: 'o', 10: 'd', 16: 'h'}
+radix_function = {
+    2  : lambda i, size: bin(i)[2:].zfill(size), 
+    8  : lambda i, size: oct(i)[1:].zfill(size),
+    10 : lambda i, size: str(i).zfill(size),
+    16 : lambda i, size: hex(i)[2:].zfill(size)
+}
+
+header = (
+"""
+module {name}({inpname}, {outname});
+\tparameter DEPTH={depth};
+\tparameter WIDTH={width};
+
+\tinput [DEPTH-1:0] {inpname};
+\toutput reg [WIDTH-1:0] {outname};
+
+\talways @* begin
+\t\tcase ({inpname})"""
+)
+
+entry = "\t\t\t{depth}'b{addr}: {outname} = {width}'{data};"
+
+footer = (
+"""\t\t\tdefault: {outname} = {width}'{radix_prefix}{default};
+\t\tendcase
+\tend
+endmodule
+"""
+)
+
+
+def error_data_overflow(expected):
+    logger.exception("Expected '%d' entries, but there are more.", expected)
+    sys.exit(1)
+
+def error_data_underflow(expected, actual):
+    logger.exception("Expected '%d' entries, but there are only '%d'." % (expected, actual))
+    sys.exit(2)
+
+def error_argument_radix_out_of_range(value):
+    logger.exception("--radix out of range. '%d' is not 2, 8, 10, or 16.", value)
+    sys.exit(3)
+
+def error_file_open(path, mode):
+    logger.exception("Error opening file at path '%s' in mode '%s'.", path, mode)
+    sys.exit(4)
+
+def error_file_read():
+    logger.exception("Error reading from file.")
+    sys.exit(5)
+
+def error_file_write():
+    logger.exception("Error writing to file.")
+    sys.exit(6)
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(description='Generate verilog rom module.')
+
+    ## Required
+    parser.add_argument('--name', '-n', type=str, help='The name of the generated module.', dest='name', required=True)
+    parser.add_argument('--depth', '-d', type=int, help='The depth of the generated rom.', dest='depth', required=True)
+    parser.add_argument('--width', '-w', type=int, help='The width of the generated rom.', dest='width', required=True)
+    parser.add_argument('--radix', '-r', type=int, help='The radix of the input data.  (Must be between 2, 8, 10, or 16.)', dest='radix', required=True)
+
+    ## Optional
+    parser.add_argument('--in', '-i', type=str, help='The file to read from.  (defaults to stdin)', dest='inpath')
+    parser.add_argument('--out', '-o', type=str, help='The file to write to.  (defaults to stdout)', dest='outpath')
+    parser.add_argument('--default', type=str, help='The default value for out of range data.  (defaults to 0)', default='0', dest='default')
+    parser.add_argument('--verbose', help='Verbose logging.', default=False, dest='verbose', action='store_const', const=True)
+    parser.add_argument('--debug', help='Debug logging (very verbose).', default=False, dest='debug', action='store_const', const=True)
+
+    parser.add_argument('--arg-input-name', type=str, help='The name of the input parameter.  (defaults to inp)', default='inp', dest='inpname')
+    parser.add_argument('--arg-output-name', type=str, help='The name of the output parameter.  (defaults to out)', default='out', dest='outname')
+
+    args = parser.parse_args(argv)
+    return args
+
+
+def process_args(args):
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+    elif args.verbose:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.ERROR)
+
+
+    if not args.radix in {2, 8, 10, 16}:
+        raise error_argument_radix_out_of_range(args.radix)
+    if args.inpath:
+        try:
+            args.inpath = open(args.inpath)
+        except Exception:
+            error_file_open(args.inpath, "r")
+    else:
+        args.inpath = sys.stdin
+    if args.outpath:
+        try:
+            args.outpath = open(args.outpath, "w")
+        except Exception:
+            error_file_open(args.outpath, "w")
+    else:
+        args.outpath = sys.stdout
+    return args
+
+
+def _get_next_valid(handle):
+    v = handle.read(1)
+    while v == comment or v in ignores:
+        if v == comment:
+            while v != "\n":
+                v = handle.read(1)
+        while v in ignores:
+            v = handle.read(1)
+    return v
+
+
+def read_data(handle, radix, width):
+    v    = None
+    p    = radix_prefix[radix]
+    f    = radix_function[radix]
+    size = int(log(2**width, radix))
+
+    try:
+        while not v == '':
+            byte = []
+            for _ in range(size):
+                v = _get_next_valid(handle)
+                if v == '':
+                    raise StopIteration()
+                byte.append(v)
+            bytevalue = int("".join(byte), radix)
+            yield p+f(bytevalue, size)
+    except IOError:
+        error_file_read()
+
+
+def write_header(args):
+    formated = header.format(name=args.name, 
+                             inpname=args.inpname,
+                             outname=args.outname,
+                             depth=args.depth,
+                             width=args.width)
+    try:
+        logger.debug("Writing header...")
+        args.outpath.write(formated)
+        args.outpath.write("\n")
+        logger.debug("...wrote header.")
+    except Exception:
+        raise FileWriteError()
+
+
+def write_footer(args):
+    formated = footer.format(width=args.width,
+                             outname=args.outname,
+                             radix_prefix=radix_prefix[args.radix],
+                             default=args.default)
+    try:
+        logger.debug("Writing footer...")
+        args.outpath.write(formated)
+        logger.debug("...wrote footer,")
+    except IOError:
+        error_file_write()
+
+
+def write_data(addr, byte, args):
+    binaddr = bin(addr)[2:].zfill(args.depth)
+    formated = entry.format(addr=binaddr,
+                            data=byte,
+                            depth=args.depth,
+                            width=args.width,
+                            outname=args.outname)
+    try:
+        logger.debug("Writing entry...")
+        args.outpath.write(formated)
+        args.outpath.write("\n")
+        logger.debug("...wrote entry.")
+    except IOError:
+        error_file_write()
+
+
+def write_module(args):
+    max_addr = 2**args.depth
+
+    logger.info("Maximum address: %d", max_addr)
+
+    write_header(args)
+
+    for addr, byte in enumerate(read_data(args.inpath, args.radix, args.width)):
+        logger.info("current address: %d = %s", addr, byte)
+        if addr >= max_addr:
+            error_data_overflow(max_addr - 1 * args.width / args.radix)
+        write_data(addr, byte, args)
+    if addr < max_addr - 1:
+        error_data_underflow(max_addr - 1 * args.width / args.radix, addr)
+
+    write_footer(args)
+
+
+if __name__ == '__main__':
+    args = parse_args(sys.argv[1:])
+    args = process_args(args)
+    try:
+        write_module(args)
+    except SystemExit:
+        pass
+    except Exception:
+        logger.exception("Exception bubbled to top.")
